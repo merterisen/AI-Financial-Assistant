@@ -2,6 +2,7 @@ from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_core.documents import Document
 from typing import List, Tuple
 import re
+import fitz  # PyMuPDF
 
 class PDFManager:
 
@@ -15,34 +16,33 @@ class PDFManager:
         return pages
 
 
-    def split_pages(self, pages: list) -> Tuple[List[int], List[int]]:
-        financial_table_pages = []
-        standard_text_pages = []
+    def split_pages(self, pages: List[Document]) -> Tuple[List[Document], List[Document]]:
+        financial_pages: List[Document] = []
+        normal_pages: List[Document] = []
 
-        for i, page in enumerate(pages):
+        for page in pages:
             page_text = page.page_content
-            page_number = i + 1
+            is_financial = self._detect_financial_table(page_text)
 
-            is_table, page_score = self._detect_financial_table(page_text)
-
-            if is_table:
-                financial_table_pages.append(page_number)
+            if is_financial:
+                financial_pages.append(page)
             else:
-                standard_text_pages.append(page_number)
-        
-        return financial_table_pages, standard_text_pages
+                normal_pages.append(page)
 
+        return financial_pages, normal_pages
 
     # =================================================================
     # LOCAL FUNCTIONS
     # =================================================================
 
-    def _detect_financial_table(self, text) -> Tuple[bool, int]:
+    def _detect_financial_table(self, text: str) -> bool:
+        """
+        Detects if the page is a financial table.
+        """
         score = 0
         text_lower = text.lower()
         threshold = 50
         
-        # Kriter 1: Birincil ve İkincil Anahtar Kelimeler
         primary_keywords = [
             "income statement",
             "consolidated statement of income",
@@ -114,7 +114,7 @@ class PDFManager:
         if year_matches >= 4:
             score += 30
 
-        is_table = score >= threshold
+        is_financial_table = score >= threshold
         
-        return is_table, score
+        return is_financial_table
     
