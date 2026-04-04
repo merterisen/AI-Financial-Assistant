@@ -1,11 +1,13 @@
 from typing import List, Literal, Optional, Sequence
-
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
-from langchain_community.chat_models import ChatOllama
+from langchain_ollama import ChatOllama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from llama_parse import LlamaParse
+import json
+from managers.financial_tables import FinancialStatements
 
 class LLMManager:
     def __init__(
@@ -59,6 +61,93 @@ class LLMManager:
     # GLOBAL FUNCTIONS
     # ------------------------------------------------------------------
 
+
+    @staticmethod
+    def extract_financial_markdown_tables(pdf_path: str, financial_pages: list[Document]) -> str:
+        """
+        Use LlamaParse to extract markdown tables only from the pages that were detected as financial pages.
+        """
+
+        # Collect 0-based page indices from metadata
+        page_numbers_0 = sorted({
+            p.metadata.get("page")
+            for p in financial_pages
+            if isinstance(p.metadata, dict) and p.metadata.get("page") is not None
+        })
+
+        # If no financial pages detected, do not parse at all
+        if not page_numbers_0:
+            return ""
+
+        # Convert to 1-based page indices for LlamaParse
+        target_pages = ",".join(str(p + 1) for p in page_numbers_0)
+
+        try:
+            parser = LlamaParse(
+                result_type="markdown",
+                target_pages=target_pages,
+                verbose=False,
+            )
+            llama_docs = parser.load_data(pdf_path)
+        except Exception:
+            return ""
+
+        if not llama_docs:
+            return ""
+
+        md = "\n\n".join(getattr(d, "text", "") for d in llama_docs).strip()
+        return md
+
+
+
+
+
+    def build_structured_financial_data(self, markdown: str) -> dict:
+        """
+        Turn LlamaParse markdown into strict FinancialStatements Pydantic models
+        and then into a plain Python dict.
+        """
+        # Empty markdown => return all-None model
+        if not markdown.strip():
+            empty = FinancialStatements(
+                income_statement={},
+                balance_sheet={},
+                cash_flow={},
+            )
+            return empty.model_dump()
+
+        from langchain_core.prompts import ChatPromptTemplate  # local import to avoid cycles
+
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "You are an expert accountant. Extract standardized financial statements "
+                    "from the markdown tables. If a numeric value is not clearly present, "
+                    "set it to null and do NOT guess or infer.",
+                ),
+                ("human", "Markdown tables:\n{md}"),
+            ]
+        )
+
+        try:
+            chain = prompt | self._llm.with_structured_output(FinancialStatements)
+            statements: FinancialStatements = chain.invoke({"md": markdown})
+            return statements.model_dump()
+        except Exception:
+            empty = FinancialStatements(
+                income_statement={},
+                balance_sheet={},
+                cash_flow={},
+            )
+            return empty.model_dump()
+
+
+
+
+
+
+
     def build_normal_pages_index(
         self,
         normal_pages: List[Document],
@@ -84,11 +173,15 @@ class LLMManager:
         self._retriever = self._vectorstore.as_retriever()
 
 
+
+
+
     def answer_question_over_context(
         self,
         question: str,
         k: int = 4,
         system_instructions: Optional[str] = None,
+        financial_data: Optional[dict] = None,
     ) -> str:
 
         docs: List[Document] = self._retriever.invoke(question)[:k]
@@ -96,24 +189,44 @@ class LLMManager:
         context = "\n\n".join(d.page_content for d in docs)
 
         base_system = (
-            "You are a financial analyst assistant. Only answer questions based solely on the provided document context. "
-            "Do not use outside knowledge or make assumptions not supported explicitly by the context. "
-            "If the context is insufficient, say you don't know instead of guessing."
+            "You are a financial analyst assistant. Only answer questions based solely on the "
+            "provided document context and structured JSON data. "
+            "Do not use outside knowledge or make assumptions not supported explicitly by the inputs. "
+            "If the inputs are insufficient, say you don't know instead of guessing."
         )
         
+        financial_json = ""
+        if financial_data is not None:
+            base_system += (
+                "\n\nYou are also given structured financial statement data as JSON. "
+                "If the JSON contains the relevant value, prefer it over the text context. "
+                "If a JSON field is null or missing, rely on the text context. Never fabricate values."
+            )
+            financial_json = json.dumps(financial_data, ensure_ascii=False, indent=2)
+
         if system_instructions:
             base_system += "\n\nAdditional instructions:\n" + system_instructions
+
 
         prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", base_system),
                 (
                     "human",
-                    "Context:\n{context}\n\nQuestion: {question}\n\nAnswer in a concise, expert tone.",
+                    "Structured financial data (JSON, may contain nulls):\n{financial_json}\n\n"
+                    "Context:\n{context}\n\n"
+                    "Question: {question}\n\n"
+                    "Answer in a concise, expert tone.",
                 ),
             ]
         )
 
         chain = prompt | self._llm
-        answer = chain.invoke({"context": context, "question": question})
+        answer = chain.invoke(
+            {
+                "context": context,
+                "question": question,
+                "financial_json": financial_json,
+            }
+        )
         return getattr(answer, "content", str(answer))
